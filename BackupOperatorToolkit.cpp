@@ -4,6 +4,14 @@
 #include <algorithm>
 #include <cctype>
 #include <Windows.h>
+#include <objbase.h>
+#include <vss.h>
+#include <vswriter.h>
+#include <vsbackup.h>
+#include <vsprov.h>
+
+#pragma comment(lib, "VssApi.lib")
+#pragma comment(lib, "Ole32.lib")
 #include <vector>
 #include <Aclapi.h>
 
@@ -45,6 +53,26 @@ static std::string FormatErrorMessage(DWORD errorCode) {
 	}
 
 	return message;
+}
+
+static std::string ConvertToNarrow(const std::wstring& value) {
+	if (value.empty()) {
+		return std::string();
+	}
+
+	int required = WideCharToMultiByte(CP_ACP, 0, value.c_str(), -1, nullptr, 0, NULL, NULL);
+	if (required <= 0) {
+		return std::string();
+	}
+
+	std::string narrow(static_cast<size_t>(required - 1), '\0');
+	if (!narrow.empty()) {
+		int converted = WideCharToMultiByte(CP_ACP, 0, value.c_str(), -1, &narrow[0], required, NULL, NULL);
+		if (converted == 0) {
+			return std::string();
+		}
+	}
+	return narrow;
 }
 
 static std::wstring ConvertToWide(const char* value) {
@@ -175,6 +203,364 @@ static bool BuildRemoteUncPath(const std::string& machineName, const std::string
 	}
 
 	return false;
+}
+
+#ifndef STATUS_SHARING_VIOLATION
+#define STATUS_SHARING_VIOLATION ((NTSTATUS)0xC0000043L)
+#endif
+
+#ifndef STATUS_OBJECT_NAME_INVALID
+#define STATUS_OBJECT_NAME_INVALID ((NTSTATUS)0xC0000033L)
+#endif
+
+#ifndef VSS_CTX_FILE_SHARE_BACKUP
+#define VSS_CTX_FILE_SHARE_BACKUP ((VSS_SNAPSHOT_CONTEXT)0x00000040)
+#endif
+
+struct RemoteShadowCopyContext {
+	IVssBackupComponents* backup;
+	VSS_ID snapshotSetId;
+	VSS_ID snapshotId;
+	bool coInitialized;
+
+	RemoteShadowCopyContext() : backup(NULL), snapshotSetId(GUID_NULL), snapshotId(GUID_NULL), coInitialized(false) {}
+};
+
+static bool SplitUncPath(const std::wstring& fullPath, std::wstring& shareRoot, std::wstring& relativePath) {
+	if (fullPath.empty()) {
+		return false;
+	}
+
+	if (fullPath.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+		std::wstring trimmed = L"\\\\" + fullPath.substr(8);
+		return SplitUncPath(trimmed, shareRoot, relativePath);
+	}
+
+	if (fullPath.rfind(L"\\\\", 0) != 0) {
+		return false;
+	}
+
+	size_t firstSlash = fullPath.find(L'\\', 2);
+	if (firstSlash == std::wstring::npos) {
+		return false;
+	}
+
+	size_t secondSlash = fullPath.find(L'\\', firstSlash + 1);
+	if (secondSlash == std::wstring::npos) {
+		shareRoot = fullPath;
+		relativePath.clear();
+		return true;
+	}
+
+	shareRoot = fullPath.substr(0, secondSlash);
+	relativePath = fullPath.substr(secondSlash);
+	return true;
+}
+
+static std::wstring BuildPathFromRootAndRelative(const std::wstring& root, const std::wstring& relative) {
+	if (relative.empty()) {
+		return root;
+	}
+
+	std::wstring result = root;
+	bool rootEndsWithSlash = !result.empty() && result.back() == L'\\';
+	bool relativeStartsWithSlash = !relative.empty() && relative.front() == L'\\';
+
+	if (rootEndsWithSlash && relativeStartsWithSlash) {
+		result.pop_back();
+	}
+	else if (!rootEndsWithSlash && !relativeStartsWithSlash) {
+		result.push_back(L'\\');
+	}
+
+	result += relative;
+	return result;
+}
+
+static void ReleaseRemoteShadowCopyContext(RemoteShadowCopyContext& context) {
+	if (context.backup != NULL) {
+		LONG deleted = 0;
+		VSS_ID nonDeleted = GUID_NULL;
+		context.backup->DeleteSnapshots(context.snapshotId, VSS_OBJECT_SNAPSHOT, TRUE, &deleted, &nonDeleted);
+		context.backup->Release();
+		context.backup = NULL;
+	}
+
+	if (context.coInitialized) {
+		CoUninitialize();
+		context.coInitialized = false;
+	}
+
+	context.snapshotId = GUID_NULL;
+	context.snapshotSetId = GUID_NULL;
+}
+
+static void FreeProviderStrings(VSS_PROVIDER_PROP& prop) {
+	if (prop.m_pwszProviderName) {
+		CoTaskMemFree(prop.m_pwszProviderName);
+		prop.m_pwszProviderName = NULL;
+	}
+	if (prop.m_pwszProviderVersion) {
+		CoTaskMemFree(prop.m_pwszProviderVersion);
+		prop.m_pwszProviderVersion = NULL;
+	}
+}
+
+static bool ResolveFileShareProviderId(IVssBackupComponents* backup, VSS_ID& providerId) {
+	providerId = GUID_NULL;
+	if (backup == NULL) {
+		return false;
+	}
+
+	IVssEnumObject* enumerator = NULL;
+	HRESULT hr = backup->Query(GUID_NULL, VSS_OBJECT_NONE, VSS_OBJECT_PROVIDER, &enumerator);
+	if (FAILED(hr) || enumerator == NULL) {
+		printf("[-] VSS provider enumeration failed: 0x%08lx\n", static_cast<long>(hr));
+		return false;
+	}
+
+	bool found = false;
+	VSS_OBJECT_PROP prop = {};
+	ULONG fetched = 0;
+
+	while (true) {
+		hr = enumerator->Next(1, &prop, &fetched);
+		if (hr == S_FALSE) {
+			break;
+		}
+		if (FAILED(hr)) {
+			printf("[-] Enumerator::Next failed: 0x%08lx\n", static_cast<long>(hr));
+			break;
+		}
+		if (fetched == 0) {
+			continue;
+		}
+
+		if (prop.Type == VSS_OBJECT_PROVIDER) {
+			VSS_PROVIDER_PROP& provider = prop.Obj.Prov;
+			if (provider.m_eProviderType == VSS_PROV_FILESHARE) {
+				providerId = provider.m_ProviderId;
+				found = true;
+				FreeProviderStrings(provider);
+				break;
+			}
+			FreeProviderStrings(provider);
+		}
+	}
+
+	if (!found) {
+		printf("[-] Unable to locate a file share VSS provider on the system.\n");
+	}
+
+	if (enumerator) {
+		enumerator->Release();
+	}
+	return found;
+}
+
+static bool CreateRemoteShadowCopyContext(const std::wstring& remoteFilePath, std::wstring& snapshotFilePath, RemoteShadowCopyContext& context) {
+	context = RemoteShadowCopyContext();
+	snapshotFilePath.clear();
+
+	std::wstring shareRoot;
+	std::wstring relativePath;
+	if (!SplitUncPath(remoteFilePath, shareRoot, relativePath)) {
+		printf("[-] Remote path is not a UNC path; cannot create shadow copy.\n");
+		return false;
+	}
+
+	HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+		printf("[-] CoInitializeEx failed: 0x%08lx\n", static_cast<long>(hr));
+		return false;
+	}
+
+	if (SUCCEEDED(hr)) {
+		context.coInitialized = true;
+	}
+
+	HRESULT securityHr = CoInitializeSecurity(
+		NULL,
+		-1,
+		NULL,
+		NULL,
+		RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+		RPC_C_IMP_LEVEL_IDENTIFY,
+		NULL,
+		EOAC_NONE,
+		NULL);
+	if (FAILED(securityHr) && securityHr != RPC_E_TOO_LATE) {
+		printf("[-] CoInitializeSecurity failed: 0x%08lx\n", static_cast<long>(securityHr));
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	IVssBackupComponents* backup = NULL;
+	hr = CreateVssBackupComponentsInternal(&backup);
+	if (FAILED(hr) || backup == NULL) {
+		printf("[-] CreateVssBackupComponentsInternal failed: 0x%08lx\n", static_cast<long>(hr));
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	hr = backup->InitializeForBackup(NULL);
+	if (FAILED(hr)) {
+		printf("[-] InitializeForBackup failed: 0x%08lx\n", static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	hr = backup->SetContext(VSS_CTX_FILE_SHARE_BACKUP);
+	if (FAILED(hr)) {
+		printf("[-] SetContext(VSS_CTX_FILE_SHARE_BACKUP) failed: 0x%08lx\n", static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	hr = backup->SetBackupState(FALSE, FALSE, VSS_BT_COPY, FALSE);
+	if (FAILED(hr)) {
+		printf("[-] SetBackupState failed: 0x%08lx\n", static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	VSS_ID snapshotSetId = GUID_NULL;
+	hr = backup->StartSnapshotSet(&snapshotSetId);
+	if (FAILED(hr)) {
+		printf("[-] StartSnapshotSet failed: 0x%08lx\n", static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	VSS_ID providerId = GUID_NULL;
+	if (!ResolveFileShareProviderId(backup, providerId)) {
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	VSS_ID snapshotId = GUID_NULL;
+	VSS_PWSZ shareRootPtr = const_cast<VSS_PWSZ>(shareRoot.c_str());
+	hr = backup->AddToSnapshotSet(shareRootPtr, providerId, &snapshotId);
+	if (FAILED(hr)) {
+		printf("[-] AddToSnapshotSet failed for %ls: 0x%08lx\n", shareRoot.c_str(), static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	IVssAsync* async = NULL;
+	hr = backup->PrepareForBackup(&async);
+	if (SUCCEEDED(hr) && async != NULL) {
+		hr = async->Wait();
+		async->Release();
+		async = NULL;
+	}
+	else if (async != NULL) {
+		async->Release();
+		async = NULL;
+	}
+	if (FAILED(hr)) {
+		printf("[-] PrepareForBackup failed: 0x%08lx\n", static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	hr = backup->DoSnapshotSet(&async);
+	if (SUCCEEDED(hr) && async != NULL) {
+		hr = async->Wait();
+		async->Release();
+		async = NULL;
+	}
+	else if (async != NULL) {
+		async->Release();
+		async = NULL;
+	}
+	if (FAILED(hr)) {
+		printf("[-] DoSnapshotSet failed: 0x%08lx\n", static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	VSS_SNAPSHOT_PROP props = {};
+	hr = backup->GetSnapshotProperties(snapshotId, &props);
+	if (FAILED(hr)) {
+		printf("[-] GetSnapshotProperties failed: 0x%08lx\n", static_cast<long>(hr));
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	std::wstring basePath;
+	if (props.m_pwszSnapshotDeviceObject && props.m_pwszSnapshotDeviceObject[0] != L'\0') {
+		basePath = props.m_pwszSnapshotDeviceObject;
+	}
+	else if (props.m_pwszExposedPath && props.m_pwszExposedPath[0] != L'\0') {
+		basePath = props.m_pwszExposedPath;
+	}
+	else if (props.m_pwszExposedName && props.m_pwszExposedName[0] != L'\0') {
+		basePath = props.m_pwszExposedName;
+	}
+
+	if (basePath.empty()) {
+		printf("[-] Snapshot properties did not contain an accessible path.\n");
+		VssFreeSnapshotProperties(&props);
+		backup->Release();
+		if (context.coInitialized) {
+			CoUninitialize();
+			context.coInitialized = false;
+		}
+		return false;
+	}
+
+	snapshotFilePath = BuildPathFromRootAndRelative(basePath, relativePath);
+	VssFreeSnapshotProperties(&props);
+
+	context.backup = backup;
+	context.snapshotId = snapshotId;
+	context.snapshotSetId = snapshotSetId;
+
+	printf("[*] Created remote shadow copy for %ls\n", shareRoot.c_str());
+	return true;
 }
 
 
@@ -597,7 +983,8 @@ void copylocal(){
 		return;
 	}
 
-	std::wstring extendedRemotePath = BuildExtendedPath(remotePathW);
+	std::wstring currentRemotePath = remotePathW;
+	std::wstring extendedRemotePath = BuildExtendedPath(currentRemotePath);
 	std::wstring extendedLocalPath = BuildExtendedPath(localPathW);
 
 	auto buildNtPath = [](const std::wstring& extended) -> std::wstring {
@@ -616,15 +1003,15 @@ void copylocal(){
 		return L"\\??\\" + extended;
 	};
 
-	std::wstring remoteNtPath = buildNtPath(extendedRemotePath);
-	if (remoteNtPath.empty()) {
-		printf("[-] Failed to build NT path for remote file.\n");
-		return;
-	}
-
 	std::wstring localNtPath = buildNtPath(extendedLocalPath);
 	if (localNtPath.empty()) {
 		printf("[-] Failed to build NT path for local file.\n");
+		return;
+	}
+
+	std::wstring currentRemoteNtPath = buildNtPath(extendedRemotePath);
+	if (currentRemoteNtPath.empty()) {
+		printf("[-] Failed to build NT path for remote file.\n");
 		return;
 	}
 
@@ -745,48 +1132,100 @@ void copylocal(){
 		attrs.SecurityQualityOfService = NULL;
 	};
 
-	UNICODE_STRING_LOCAL remoteName = {};
-	if (!initUnicodeString(remoteName, remoteNtPath)) {
-		printf("[-] Remote NT path is too long.\n");
+	RemoteShadowCopyContext shadowContext;
+	bool usingShadowCopy = false;
+	HANDLE remoteHandle = NULL;
+	HANDLE localHandle = NULL;
+
+	auto cleanup = [&]() {
+		if (localHandle != NULL) {
+			CloseHandle(localHandle);
+			localHandle = NULL;
+		}
+		if (remoteHandle != NULL) {
+			CloseHandle(remoteHandle);
+			remoteHandle = NULL;
+		}
+		ReleaseRemoteShadowCopyContext(shadowContext);
+	};
+
+	auto openRemoteHandle = [&](HANDLE& handle, const std::wstring& ntPath, IO_STATUS_BLOCK_LOCAL& statusBlock) -> NTSTATUS {
+		handle = NULL;
+		UNICODE_STRING_LOCAL remoteName = {};
+		if (!initUnicodeString(remoteName, ntPath)) {
+			printf("[-] Remote NT path is too long.\n");
+			return static_cast<NTSTATUS>(STATUS_OBJECT_NAME_INVALID);
+		}
+		OBJECT_ATTRIBUTES_LOCAL remoteAttributes = {};
+		initObjectAttributes(remoteAttributes, remoteName);
+		statusBlock = IO_STATUS_BLOCK_LOCAL();
+		return NtCreateFilePtr(
+			&handle,
+			GENERIC_READ | SYNCHRONIZE,
+			&remoteAttributes,
+			&statusBlock,
+			NULL,
+			FILE_ATTRIBUTE_NORMAL,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			FILE_OPEN,
+			FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+			NULL,
+			0);
+	};
+
+	IO_STATUS_BLOCK_LOCAL remoteStatus = {};
+	NTSTATUS remoteNtStatus = 0;
+	std::string remoteErrorMessage;
+
+	for (int attempt = 0; attempt < 2; ++attempt) {
+		remoteNtStatus = openRemoteHandle(remoteHandle, currentRemoteNtPath, remoteStatus);
+		if (NT_SUCCESS(remoteNtStatus)) {
+			break;
+		}
+
+		remoteErrorMessage = formatStatus(remoteNtStatus);
+
+		if (attempt == 0 && remoteNtStatus == STATUS_SHARING_VIOLATION) {
+			std::wstring snapshotPath;
+			if (CreateRemoteShadowCopyContext(remotePathW, snapshotPath, shadowContext)) {
+				usingShadowCopy = true;
+				currentRemotePath = snapshotPath;
+				extendedRemotePath = BuildExtendedPath(currentRemotePath);
+				currentRemoteNtPath = buildNtPath(extendedRemotePath);
+				if (currentRemoteNtPath.empty()) {
+					printf("[-] Failed to build NT path for shadow copy.\n");
+					cleanup();
+					return;
+				}
+				continue;
+			}
+			else {
+				printf("[-] Shadow copy creation failed; unable to bypass sharing violation.\n");
+			}
+		}
+
+		break;
+	}
+
+	if (!NT_SUCCESS(remoteNtStatus)) {
+		const std::string& message = remoteErrorMessage.empty() ? formatStatus(remoteNtStatus) : remoteErrorMessage;
+		std::string displayPath = usingShadowCopy ? ConvertToNarrow(currentRemotePath) : (remotePath ? std::string(remotePath) : std::string());
+		printf("[-] NtCreateFile (remote: %s) failed: %s\n", displayPath.empty() ? (remotePath ? remotePath : "<null>") : displayPath.c_str(), message.c_str());
+		cleanup();
 		return;
 	}
 
 	UNICODE_STRING_LOCAL localName = {};
 	if (!initUnicodeString(localName, localNtPath)) {
 		printf("[-] Local NT path is too long.\n");
+		cleanup();
 		return;
 	}
-
-	OBJECT_ATTRIBUTES_LOCAL remoteAttributes = {};
-	initObjectAttributes(remoteAttributes, remoteName);
 
 	OBJECT_ATTRIBUTES_LOCAL localAttributes = {};
 	initObjectAttributes(localAttributes, localName);
-
-	IO_STATUS_BLOCK_LOCAL remoteStatus = {};
 	IO_STATUS_BLOCK_LOCAL localStatus = {};
-
-	HANDLE remoteHandle = NULL;
 	NTSTATUS status = NtCreateFilePtr(
-		&remoteHandle,
-		GENERIC_READ | SYNCHRONIZE,
-		&remoteAttributes,
-		&remoteStatus,
-		NULL,
-		FILE_ATTRIBUTE_NORMAL,
-		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-		FILE_OPEN,
-		FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
-		NULL,
-		0);
-	if (!NT_SUCCESS(status)) {
-		std::string message = formatStatus(status);
-		printf("[-] NtCreateFile (remote: %s) failed: %s\n", remotePath, message.c_str());
-		return;
-	}
-
-	HANDLE localHandle = NULL;
-	status = NtCreateFilePtr(
 		&localHandle,
 		GENERIC_WRITE | SYNCHRONIZE,
 		&localAttributes,
@@ -801,8 +1240,15 @@ void copylocal(){
 	if (!NT_SUCCESS(status)) {
 		std::string message = formatStatus(status);
 		printf("[-] NtCreateFile (local: %s) failed: %s\n", localPath, message.c_str());
-		CloseHandle(remoteHandle);
+		cleanup();
 		return;
+	}
+
+	if (usingShadowCopy) {
+		std::string snapshotDisplay = ConvertToNarrow(currentRemotePath);
+		if (!snapshotDisplay.empty()) {
+			printf("[*] Reading from shadow copy path %s\n", snapshotDisplay.c_str());
+		}
 	}
 
 	BYTE buffer[1 << 16];
@@ -843,8 +1289,7 @@ void copylocal(){
 		}
 	}
 
-	CloseHandle(localHandle);
-	CloseHandle(remoteHandle);
+	cleanup();
 }
 
 void delremote(){
