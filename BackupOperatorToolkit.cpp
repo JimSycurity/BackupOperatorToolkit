@@ -385,9 +385,9 @@ static bool CreateRemoteShadowCopyContext(const std::wstring& remoteFilePath, st
 		NULL,
 		NULL,
 		RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
-		RPC_C_IMP_LEVEL_IDENTIFY,
+		RPC_C_IMP_LEVEL_IMPERSONATE,
 		NULL,
-		EOAC_NONE,
+		EOAC_DYNAMIC_CLOAKING,
 		NULL);
 	if (FAILED(securityHr) && securityHr != RPC_E_TOO_LATE) {
 		printf("[-] CoInitializeSecurity failed: 0x%08lx\n", static_cast<long>(securityHr));
@@ -409,9 +409,9 @@ static bool CreateRemoteShadowCopyContext(const std::wstring& remoteFilePath, st
 		return false;
 	}
 
-	hr = backup->InitializeForBackup(NULL);
+	hr = backup->SetContext(VSS_CTX_FILE_SHARE_BACKUP);
 	if (FAILED(hr)) {
-		printf("[-] InitializeForBackup failed: 0x%08lx\n", static_cast<long>(hr));
+		printf("[-] SetContext(VSS_CTX_FILE_SHARE_BACKUP) failed: 0x%08lx\n", static_cast<long>(hr));
 		backup->Release();
 		if (context.coInitialized) {
 			CoUninitialize();
@@ -420,9 +420,9 @@ static bool CreateRemoteShadowCopyContext(const std::wstring& remoteFilePath, st
 		return false;
 	}
 
-	hr = backup->SetContext(VSS_CTX_FILE_SHARE_BACKUP);
+	hr = backup->InitializeForBackup(NULL);
 	if (FAILED(hr)) {
-		printf("[-] SetContext(VSS_CTX_FILE_SHARE_BACKUP) failed: 0x%08lx\n", static_cast<long>(hr));
+		printf("[-] InitializeForBackup failed: 0x%08lx\n", static_cast<long>(hr));
 		backup->Release();
 		if (context.coInitialized) {
 			CoUninitialize();
