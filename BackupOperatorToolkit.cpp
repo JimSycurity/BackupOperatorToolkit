@@ -14,6 +14,7 @@
 #pragma comment(lib, "Ole32.lib")
 #include <vector>
 #include <Aclapi.h>
+#include <sddl.h>
 
 LPCSTR mode = NULL;
 LPCSTR behaviour = NULL;
@@ -27,6 +28,7 @@ LPCSTR password = NULL;
 LPCSTR domain = NULL;
 LPCSTR ifeoservice = NULL;
 LPCSTR ifeoservicepath = NULL;
+LPCSTR deniesid = NULL;
 DWORD value = NULL;
 
 static std::string FormatErrorMessage(DWORD errorCode) {
@@ -573,6 +575,7 @@ void help(){
 	printf("Usage: BackupOperatorToolkit.exe COPYLOCAL C:\\LocalPath\\ \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
 	printf("Usage: BackupOperatorToolkit.exe DELREMOTE \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
 	printf("Usage: BackupOperatorToolkit.exe OWNREMOTE \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt");
+	printf("Usage: BackupOperatorToolkit.exe DENYACE \\\\TARGET.DOMAIN.COM\\c$\\temp\\file.txt SID");
 }
 
 void service(){
@@ -1675,6 +1678,114 @@ void ownremote(){
 	CloseHandle(remoteHandle);
 }
 
+void denyace() {
+	const char* remotePath = target;
+	const char* sidString = deniesid;
+
+	if (remotePath == NULL || remotePath[0] == '\0') {
+		printf("[-] Remote file path is missing.\n");
+		return;
+	}
+
+	if (sidString == NULL || sidString[0] == '\0') {
+		printf("[-] SID argument is missing.\n");
+		return;
+	}
+
+	if (!EnablePrivilege(SE_BACKUP_NAME)) {
+		printf("[-] Unable to enable SeBackupPrivilege.\n");
+		return;
+	}
+
+	if (!EnablePrivilege(SE_RESTORE_NAME)) {
+		printf("[-] Unable to enable SeRestorePrivilege.\n");
+		return;
+	}
+
+	PSID denySid = NULL;
+	if (!ConvertStringSidToSidA(sidString, &denySid) || denySid == NULL) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] ConvertStringSidToSidA failed: %lu - %s\n", error, message.c_str());
+		return;
+	}
+
+	std::wstring remotePathW = ConvertToWide(remotePath);
+	if (remotePathW.empty()) {
+		printf("[-] Failed to convert remote path to wide string.\n");
+		LocalFree(denySid);
+		return;
+	}
+
+	std::wstring extendedRemotePath = BuildExtendedPath(remotePathW);
+
+	HANDLE remoteHandle = CreateFileW(
+		extendedRemotePath.c_str(),
+		READ_CONTROL | WRITE_DAC,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS | FILE_OPEN_FOR_BACKUP_INTENT,
+		NULL);
+	if (remoteHandle == INVALID_HANDLE_VALUE) {
+		DWORD error = GetLastError();
+		std::string message = FormatErrorMessage(error);
+		printf("[-] CreateFileW (remote: %s) failed: %lu - %s\n", remotePath, error, message.c_str());
+		LocalFree(denySid);
+		return;
+	}
+
+	PSECURITY_DESCRIPTOR securityDescriptor = NULL;
+	PACL existingDacl = NULL;
+	DWORD securityResult = GetSecurityInfo(remoteHandle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, &existingDacl, NULL, &securityDescriptor);
+	if (securityResult != ERROR_SUCCESS) {
+		std::string message = FormatErrorMessage(securityResult);
+		printf("[-] GetSecurityInfo failed: %lu - %s\n", securityResult, message.c_str());
+		CloseHandle(remoteHandle);
+		LocalFree(denySid);
+		return;
+	}
+
+	EXPLICIT_ACCESSW accessEntry = {};
+	accessEntry.grfAccessPermissions = GENERIC_ALL;
+	accessEntry.grfAccessMode = DENY_ACCESS;
+	accessEntry.grfInheritance = NO_INHERITANCE;
+	accessEntry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	accessEntry.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+	accessEntry.Trustee.ptstrName = reinterpret_cast<LPWSTR>(denySid);
+
+	PACL updatedDacl = NULL;
+	DWORD aclResult = SetEntriesInAclW(1, &accessEntry, existingDacl, &updatedDacl);
+	if (aclResult != ERROR_SUCCESS) {
+		std::string message = FormatErrorMessage(aclResult);
+		printf("[-] SetEntriesInAclW failed: %lu - %s\n", aclResult, message.c_str());
+		if (securityDescriptor) {
+			LocalFree(securityDescriptor);
+		}
+		CloseHandle(remoteHandle);
+		LocalFree(denySid);
+		return;
+	}
+
+	DWORD setResult = SetSecurityInfo(remoteHandle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL, updatedDacl, NULL);
+	if (setResult != ERROR_SUCCESS) {
+		std::string message = FormatErrorMessage(setResult);
+		printf("[-] SetSecurityInfo failed: %lu - %s\n", setResult, message.c_str());
+	}
+	else {
+		printf("[+] Added deny ACE for %s on %s.\n", sidString, remotePath);
+	}
+
+	if (updatedDacl) {
+		LocalFree(updatedDacl);
+	}
+	if (securityDescriptor) {
+		LocalFree(securityDescriptor);
+	}
+	CloseHandle(remoteHandle);
+	LocalFree(denySid);
+}
+
 int main(int argc, LPCSTR argv[])
 {
 	if (argc < 2) {
@@ -1764,7 +1875,16 @@ int main(int argc, LPCSTR argv[])
 		target = argv[2];
 		delremote();
 	}
-
+	else if (strcmp(mode, "DENYACE") == 0) {
+		if (argc < 4) {
+			help();
+			return 0;
+		}
+		printf("DENYACE MODE\n");
+		target = argv[2];
+		deniesid = argv[3];
+		denyace();
+	}
 	else {
 		help();
 		return 0;
